@@ -1,15 +1,16 @@
 """
-Mijozlar uchun bot (admin panel EMAS — bu alohida, mustaqil bot).
+Mijozlar uchun bot. Vazifalari:
 
-Vazifalari:
 1) "Oz-Lek haqida" — matn tugmasi orqali ham, ovozli xabar orqali ham so'rasa bo'ladi.
-2) Dorilar katalogi — /start bosilganda admin panelga kiritilgan dorilar menyusi chiqadi.
-   Nomini bossa yoki o'zi yozib yuborsa (hatto kichik xato bilan yoki kirillcha yozsa ham),
-   admin kiritgan rasm + tavsif chiqadi. Topilmasa — "bunday dori yo'q" deb aniq javob beradi.
+   Kichik yozuv xatolari va "Oz-Lek", "OzLek", "oz lek" kabi turli yozilishlar tushuniladi.
 
-Kril alifbosi va kichik imlo xatolari text_match.py moduli orqali qo'llab-quvvatlanadi.
-Ovozli so'rov Google Speech Recognition orqali (uz-UZ) tanib olinadi.
-Server (Railway)da ffmpeg o'rnatilgan bo'lishi kerak (pydub shuni talab qiladi).
+2) Dorilar katalogi — /start bosilganda menyu chiqadi (admin panelga qo'shilgan dorilar).
+   Dori nomini bosib yoki o'zi yozib so'rasa bo'ladi. Bunda:
+     - Kirill yozuvida yozilsa ham tushunadi ("Нимесил" -> "Nimesil")
+     - Kichik xatolar (bitta-ikkita harf farqi, katta-kichik harf) kechiriladi
+     - Hech qanday moslik topilmasa — "bunday dori yo'q" deb aniq javob beradi
+
+Ovozli so'rovni tanish uchun Google Speech Recognition ishlatiladi (uz-UZ tili).
 """
 
 import logging
@@ -24,8 +25,8 @@ from aiogram.types import (
 )
 
 import database as db
+import text_utils
 from config import PUBLIC_BOT_TOKEN
-from text_match import find_matching_medicines, is_company_info_query, is_generic_info_query
 
 logging.basicConfig(level=logging.INFO)
 
@@ -40,13 +41,25 @@ MAIN_MENU = ReplyKeyboardMarkup(
 )
 
 
-def medicines_keyboard(medicines=None):
-    medicines = medicines if medicines is not None else db.list_medicines()
+def medicines_keyboard():
+    medicines = db.list_medicines()
     buttons = [
         [InlineKeyboardButton(text=m["name"], callback_data=f"med_{m['id']}")]
         for m in medicines
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def format_medicine(m: dict) -> str:
+    return f"<b>{m['name']}</b>\n\n{m['description']}"
+
+
+async def send_medicine(message: Message, m: dict):
+    caption = format_medicine(m)
+    if m["photo_file_id"]:
+        await message.answer_photo(m["photo_file_id"], caption=caption, parse_mode="HTML")
+    else:
+        await message.answer(caption, parse_mode="HTML")
 
 
 @router.message(Command("start"))
@@ -55,7 +68,7 @@ async def cmd_start(message: Message):
         "Assalomu alaykum! Oz-Lek rasmiy botiga xush kelibsiz.\n\n"
         "💊 Dorilar katalogi — mavjud dorilarni ko'rish\n"
         "ℹ️ Oz-Lek haqida — kompaniya haqida ma'lumot\n\n"
-        "Istalgan dori nomini to'g'ridan-to'g'ri yozib yoki ovozli xabar yuborib ham so'rashingiz mumkin.",
+        "Istalgan dori nomini shunchaki yozib yuborishingiz yoki ovozli xabar bilan so'rashingiz ham mumkin.",
         reply_markup=MAIN_MENU,
     )
 
@@ -63,12 +76,12 @@ async def cmd_start(message: Message):
 # ---------- Kompaniya haqida ----------
 
 @router.message(F.text == "ℹ️ Oz-Lek haqida")
-async def company_info_button(message: Message):
+async def company_info_text(message: Message):
     await message.answer(db.get_company_info())
 
 
 @router.message(F.voice)
-async def handle_voice(message: Message, bot: Bot):
+async def company_info_voice(message: Message, bot: Bot):
     """Ovozli xabarni matnga o'giradi va so'rovga mos javob beradi."""
     await message.answer("🎧 Ovozli xabaringiz tinglanmoqda...")
 
@@ -97,6 +110,7 @@ async def handle_voice(message: Message, bot: Bot):
         )
         return
 
+    await message.answer(f"🗣 Eshitdim: <i>{text}</i>", parse_mode="HTML")
     await route_text_query(message, text)
 
 
@@ -108,7 +122,7 @@ async def catalog(message: Message):
     if not medicines:
         await message.answer("Hozircha dorilar ro'yxati bo'sh.")
         return
-    await message.answer("Kerakli dorini tanlang yoki nomini yozib yuboring:", reply_markup=medicines_keyboard(medicines))
+    await message.answer("Kerakli dorini tanlang yoki nomini yozib yuboring:", reply_markup=medicines_keyboard())
 
 
 @router.callback_query(F.data.startswith("med_"))
@@ -119,66 +133,38 @@ async def show_medicine(call: CallbackQuery):
     if not medicine:
         await call.message.answer("Bu dori topilmadi (o'chirilgan bo'lishi mumkin).")
         return
-    caption = f"<b>{medicine['name']}</b>\n\n{medicine['description']}"
-    if medicine["photo_file_id"]:
-        await call.message.answer_photo(medicine["photo_file_id"], caption=caption, parse_mode="HTML")
+    await send_medicine(call.message, medicine)
+
+
+async def route_text_query(message: Message, text: str):
+    """
+    Erkin matn/ovozdan kelgan so'rovni yo'naltiradi:
+      1) Kompaniya haqida so'rovmi? (kichik xatolarga chidamli)
+      2) Dori nomimi? (kirill/lotin, kichik xatolarga chidamli)
+      3) Hech biriga mos kelmasa -> aniq "topilmadi" javobi
+    """
+    if text_utils.is_company_query(text):
+        await message.answer(db.get_company_info())
+        return
+
+    medicines = db.list_medicines()
+    matches = text_utils.find_best_medicine_matches(text, medicines)
+
+    if not matches:
+        await message.answer(
+            f"❌ \"{text}\" nomli dori topilmadi.\n\n"
+            "Iltimos, nomini tekshirib qayta yozing yoki '💊 Dorilar katalogi' tugmasi orqali ro'yxatdan tanlang."
+        )
+        return
+
+    if len(matches) == 1:
+        await send_medicine(message, matches[0])
     else:
-        await call.message.answer(caption, parse_mode="HTML")
-
-
-async def route_text_query(message: Message, raw_text: str):
-    """
-    Erkin matn yoki ovozdan kelgan so'rovni 'kompaniya haqida' yoki 'dori nomi' ga
-    yo'naltiradi. Kirillcha yozuvni va kichik imlo xatolarini text_match.py orqali
-    tushunadi.
-
-    FIX (tartib o'zgartirildi):
-    Avvalgi versiyada is_company_info_query() ENG BIRINCHI tekshirilardi va u
-    "haqida"/"malumot" so'zlarining o'zi asosida ishlagani uchun "Parasetamol
-    haqida ma'lumot bormi" kabi DORI haqidagi so'rovlar ham xato ravishda
-    "kompaniya haqida" deb javob berilardi.
-
-    Endi tartib:
-      1) Aniq brend so'rovi (masalan "Oz-Lek haqida", "firma haqida") — darhol
-         kompaniya ma'lumoti.
-      2) Dori qidiruvi — agar mos dori(lar) topilsa, ular ko'rsatiladi.
-      3) Faqat shundan keyin, hech qanday dori topilmasa VA matnda umumiy
-         "haqida"/"malumot" so'zi bo'lsa — kompaniya ma'lumotiga fallback.
-      4) Aks holda — "bunday dori yo'q".
-    """
-
-    # 1) Brend nomiga aniq ishora (masalan "Oz-Lek haqida ayting")
-    if is_company_info_query(raw_text):
-        await message.answer(db.get_company_info())
-        return
-
-    # 2) Dori qidiruvi — bu endi generic "haqida" tekshiruvidan OLDIN bajariladi
-    all_medicines = db.list_medicines()
-    results = find_matching_medicines(raw_text, all_medicines)
-
-    if results:
-        if len(results) == 1:
-            m = results[0]
-            caption = f"<b>{m['name']}</b>\n\n{m['description']}"
-            if m["photo_file_id"]:
-                await message.answer_photo(m["photo_file_id"], caption=caption, parse_mode="HTML")
-            else:
-                await message.answer(caption, parse_mode="HTML")
-        else:
-            await message.answer("Bir nechta natija topildi, birini tanlang:", reply_markup=medicines_keyboard(results))
-        return
-
-    # 3) Dori topilmadi — endi umumiy "haqida/malumot" so'ziga fallback qilamiz
-    if is_generic_info_query(raw_text):
-        await message.answer(db.get_company_info())
-        return
-
-    # 4) Hech narsa mos kelmadi
-    await message.answer(
-        f"❌ \"{raw_text}\" nomli dori topilmadi.\n"
-        "Bunday dori yo'q, yoki nomini boshqacha yozib ko'ring, "
-        "yoki '💊 Dorilar katalogi' tugmasidan tanlang."
-    )
+        # Bir nechta yaqin moslik topilsa - tanlash uchun ro'yxat beramiz
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=m["name"], callback_data=f"med_{m['id']}")] for m in matches[:8]
+        ])
+        await message.answer("Bir nechta yaqin natija topildi, birini tanlang:", reply_markup=keyboard)
 
 
 @router.message(F.text)
