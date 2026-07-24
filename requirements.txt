@@ -1,0 +1,5 @@
+aiogram==3.4.1
+python-dotenv==1.0.1
+SpeechRecognition==3.10.1
+pydub==0.25.1
+requests==2.31.0

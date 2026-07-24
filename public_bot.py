@@ -13,6 +13,7 @@ Mijozlar uchun bot. Vazifalari:
 Ovozli so'rovni tanish uchun Google Speech Recognition ishlatiladi (uz-UZ tili).
 """
 
+import asyncio
 import logging
 import os
 import tempfile
@@ -25,6 +26,7 @@ from aiogram.types import (
 )
 
 import database as db
+import db_backup
 import text_utils
 from config import PUBLIC_BOT_TOKEN
 
@@ -173,9 +175,24 @@ async def free_text(message: Message):
     await route_text_query(message, message.text)
 
 
+async def periodic_sync(interval_seconds: int = 180):
+    """Admin panelda qilingan o'zgarishlarni har 3 daqiqada GitHub'dan qayta yuklab turadi,
+    shunda bu bot alohida serverda ishlasa ham yangilanib turadi."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            db_backup.pull_from_github(db.DB_PATH)
+            logging.info("🔄 Ma'lumotlar GitHub'dan yangilandi.")
+        except Exception as e:
+            logging.warning(f"Davriy yangilashda xatolik: {e}")
+
+
 async def run_public_bot():
     db.init_db()
     bot = Bot(token=PUBLIC_BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-    await dp.start_polling(bot)
+    await asyncio.gather(
+        dp.start_polling(bot),
+        periodic_sync(),
+    )
